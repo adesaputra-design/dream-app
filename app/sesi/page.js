@@ -3,25 +3,12 @@
 import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
-// Urutan langkah percakapan terpandu
-const STEPS = [
-  { key: "nama",       pertanyaan: null }, // langkah awal: sambutan
-  { key: "mimpi",      pertanyaan: (nama) => `Terima kasih, ${nama}.\n\nSekarang — ceritakan mimpimu. Tulis apa yang kamu ingat, sebisanya, tanpa disaring. Tidak perlu rapi, tidak perlu lengkap.` },
-  { key: "tokoh",      pertanyaan: () => "Siapa saja yang muncul dalam mimpi itu? Bisa orang yang kamu kenal, orang asing, atau bahkan sosok yang tidak jelas wajahnya." },
-  { key: "tempat",     pertanyaan: () => "Di mana mimpi itu terjadi? Gambarkan tempatnya, meski samar." },
-  { key: "simbol",     pertanyaan: () => "Adakah benda, objek, atau simbol yang terasa mencolok atau tidak biasa dalam mimpi itu?" },
-  { key: "angka",      pertanyaan: () => "Adakah angka yang muncul — entah kamu lihat, dengar, atau rasakan kehadirannya?" },
-  { key: "percakapan", pertanyaan: () => "Adakah percakapan atau kata-kata yang kamu ingat dari mimpi itu?" },
-  { key: "perasaan",   pertanyaan: () => "Apa perasaan yang paling dominan selama atau setelah mimpi itu? Bisa satu kata atau lebih." },
-  { key: "selesai",    pertanyaan: null }, // langkah akhir: transisi ke hasil
-];
-
+// Tahap 1: scripted (nama + mimpi)
 const SAMBUTAN =
   "Halo. Selamat datang di ruang eksplorasi mimpi.\n\nAku di sini untuk menemanimu menelusuri apa yang hadir dalam tidurmu.\n\nTidak ada yang benar atau salah dalam proses ini. Kita hanya akan melihat bersama — apa yang muncul, apa yang kamu rasakan, dan apa yang mungkin ingin disampaikan oleh mimpimu.\n\nSebelum kita mulai, boleh aku tahu namamu?";
 
 function ekstrakNama(teks) {
   const t = teks.trim();
-  // Pola Indonesia umum: "nama saya adalah X", "nama saya X", "namaku X", "saya X", "panggil saya X", "aku X"
   const pola = [
     /nama\s+saya\s+adalah\s+(.+)/i,
     /nama\s+saya\s+(.+)/i,
@@ -37,25 +24,26 @@ function ekstrakNama(teks) {
     const m = t.match(re);
     if (m) {
       const nama = m[1].trim().replace(/[.,!?]+$/, "");
-      // Ambil kata pertama saja jika hasilnya masih kalimat panjang
       const kata = nama.split(/\s+/);
       const hasil = kata.length <= 3 ? nama : kata[0];
       return hasil.charAt(0).toUpperCase() + hasil.slice(1);
     }
   }
-  // Tidak ada pola — gunakan input langsung (asumsi sudah nama)
   const kata = t.split(/\s+/);
   const hasil = kata.length <= 3 ? t : kata[0];
   return hasil.charAt(0).toUpperCase() + hasil.slice(1);
 }
 
+// fase: "nama" | "mimpi" | "ai" | "ekstrak"
 export default function SesiPage() {
   const router = useRouter();
   const [messages, setMessages] = useState([{ id: "0", role: "assistant", content: SAMBUTAN }]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [stepIndex, setStepIndex] = useState(0); // indeks di STEPS
-  const [elemen, setElemen] = useState({}); // menyimpan jawaban per key
+  const [fase, setFase] = useState("nama");
+  const [nama, setNama] = useState("");
+  const [mimpi, setMimpi] = useState("");
+  const [aiHistory, setAiHistory] = useState([]); // riwayat Tahap 2
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -74,7 +62,14 @@ export default function SesiPage() {
     ]);
   }
 
-  function handleSend() {
+  // Hitung progres
+  const totalSteps = 10; // estimasi max pesan AI
+  const progressPct = fase === "nama" ? 10
+    : fase === "mimpi" ? 20
+    : fase === "ekstrak" ? 95
+    : Math.min(20 + (aiHistory.filter(m => m.role === "user").length / 6) * 75, 90);
+
+  async function handleSend() {
     const text = input.trim();
     if (!text || isLoading) return;
 
@@ -82,29 +77,80 @@ export default function SesiPage() {
     setInput("");
     setIsLoading(true);
 
-    const currentStep = STEPS[stepIndex];
-    const nextStepIndex = stepIndex + 1;
-    const nextStep = STEPS[nextStepIndex];
-
-    // Simpan jawaban langkah ini — ekstrak nama jika langkah ini adalah "nama"
-    const nilaiDisimpan = currentStep.key === "nama" ? ekstrakNama(text) : text;
-    const newElemen = { ...elemen, [currentStep.key]: nilaiDisimpan };
-    setElemen(newElemen);
-
-    setTimeout(() => {
-      if (!nextStep || nextStep.key === "selesai") {
-        // Semua elemen terkumpul — kirim ke halaman hasil
-        const params = new URLSearchParams();
-        Object.entries(newElemen).forEach(([k, v]) => params.set(k, v));
+    if (fase === "nama") {
+      const namaDiekstrak = ekstrakNama(text);
+      setNama(namaDiekstrak);
+      setTimeout(() => {
+        addMessage("assistant",
+          `Terima kasih, ${namaDiekstrak}.\n\nSekarang — ceritakan mimpimu. Tulis apa yang kamu ingat, sebisanya, tanpa disaring. Tidak perlu rapi, tidak perlu lengkap.`
+        );
+        setFase("mimpi");
         setIsLoading(false);
-        router.push(`/hasil?${params.toString()}`);
-      } else {
-        const nama = newElemen.nama || ekstrakNama(text);
-        addMessage("assistant", nextStep.pertanyaan(nama));
-        setStepIndex(nextStepIndex);
-        setIsLoading(false);
+      }, 700);
+      return;
+    }
+
+    if (fase === "mimpi") {
+      setMimpi(text);
+      // Mulai Tahap 2 — panggil AI untuk pertanyaan pertama
+      await kirimKeAI(text, nama, []);
+      setFase("ai");
+      return;
+    }
+
+    if (fase === "ai") {
+      // Tambah pesan user ke history AI
+      const historyBaru = [...aiHistory, { role: "user", content: text }];
+      setAiHistory(historyBaru);
+      await kirimKeAI(mimpi, nama, historyBaru);
+    }
+  }
+
+  async function kirimKeAI(mimpiTeks, namaPengguna, history) {
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nama: namaPengguna, mimpi: mimpiTeks, history }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.error || "Gagal mendapat respons.");
+
+      addMessage("assistant", data.teks);
+
+      const historyDenganAI = [...history, { role: "assistant", content: data.teks }];
+      setAiHistory(historyDenganAI);
+
+      if (data.selesai) {
+        setFase("ekstrak");
+        await ekstrakDanNavigasi(mimpiTeks, namaPengguna, historyDenganAI);
       }
-    }, 700);
+    } catch (err) {
+      addMessage("assistant", "Maaf, ada gangguan koneksi. Silakan coba kirim ulang pesanmu.");
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function ekstrakDanNavigasi(mimpiTeks, namaPengguna, history) {
+    try {
+      const res = await fetch("/api/ekstrak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nama: namaPengguna, mimpi: mimpiTeks, history }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      const params = new URLSearchParams({
+        nama: namaPengguna,
+        ...data.elemen,
+      });
+      router.push(`/hasil?${params.toString()}`);
+    } catch {
+      router.push(`/hasil?nama=${encodeURIComponent(namaPengguna)}&mimpi=${encodeURIComponent(mimpiTeks)}`);
+    }
   }
 
   function handleKeyDown(e) {
@@ -114,9 +160,9 @@ export default function SesiPage() {
     }
   }
 
-  // Label progres
-  const stepLabels = ["Nama", "Mimpi", "Tokoh", "Tempat", "Simbol", "Angka", "Percakapan", "Perasaan"];
-  const progressPct = Math.min((stepIndex / (STEPS.length - 2)) * 100, 100);
+  const placeholder = fase === "nama" ? "Tulis namamu di sini..."
+    : fase === "mimpi" ? "Ceritakan mimpimu di sini..."
+    : "Tulis jawabanmu di sini...";
 
   return (
     <div className="min-h-screen flex flex-col" style={{ backgroundColor: "var(--cream)" }}>
@@ -139,14 +185,14 @@ export default function SesiPage() {
           Telusuri Mimpi
         </span>
         <span className="text-xs" style={{ color: "rgba(201,168,76,0.5)" }}>
-          {Math.min(stepIndex, stepLabels.length - 1) + 1}/{stepLabels.length}
+          {fase === "ekstrak" ? "Menyusun hasil..." : ""}
         </span>
       </header>
 
       {/* Progress bar */}
       <div style={{ backgroundColor: "var(--navy-light)", height: "3px" }}>
         <div
-          className="h-full transition-all duration-500"
+          className="h-full transition-all duration-700"
           style={{ width: `${progressPct}%`, backgroundColor: "var(--gold)" }}
         />
       </div>
@@ -200,10 +246,10 @@ export default function SesiPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Tulis di sini..."
+            placeholder={placeholder}
             rows={1}
-            disabled={isLoading}
-            className="flex-1 resize-none rounded-xl px-4 py-3 text-sm outline-none"
+            disabled={isLoading || fase === "ekstrak"}
+            className="flex-1 resize-none rounded-xl px-4 py-3 text-sm outline-none disabled:opacity-50"
             style={{
               backgroundColor: "var(--cream)",
               border: "1.5px solid var(--cream-dark)",
@@ -218,7 +264,7 @@ export default function SesiPage() {
           />
           <button
             onClick={handleSend}
-            disabled={!input.trim() || isLoading}
+            disabled={!input.trim() || isLoading || fase === "ekstrak"}
             className="px-5 py-3 rounded-xl text-sm font-semibold transition-all duration-150 disabled:opacity-40"
             style={{ backgroundColor: "var(--navy)", color: "var(--gold)", fontFamily: "var(--font-inter), sans-serif" }}
           >
@@ -226,7 +272,7 @@ export default function SesiPage() {
           </button>
         </div>
         <p className="text-center text-xs mt-3" style={{ color: "var(--text-muted)" }}>
-          Enter untuk kirim · Shift+Enter untuk baris baru
+          {fase === "ekstrak" ? "Sedang menyusun hasilmu..." : "Enter untuk kirim · Shift+Enter untuk baris baru"}
         </p>
       </div>
     </div>
