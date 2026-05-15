@@ -185,6 +185,19 @@ function HasilContent() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Gagal memuat refleksi.");
       setRefleksi(data.refleksi);
+
+      // Simpan sesi ke Notion — non-fatal
+      try {
+        const mimpi = sessionStorage.getItem("mimpi") || "";
+        await fetch("/api/simpan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ nama, mimpi, elemen, refleksi: data.refleksi }),
+        });
+        sessionStorage.removeItem("mimpi");
+      } catch (simpanErr) {
+        console.error("Gagal simpan ke Notion (non-fatal):", simpanErr);
+      }
     } catch (err) {
       setError(err.message);
     } finally {

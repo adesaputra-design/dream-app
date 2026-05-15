@@ -143,6 +143,8 @@ export default function SesiPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
+      sessionStorage.setItem("mimpi", mimpiTeks);
+
       const params = new URLSearchParams({
         nama: namaPengguna,
         ...data.elemen,
